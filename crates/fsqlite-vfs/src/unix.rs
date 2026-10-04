@@ -4824,7 +4824,11 @@ mod tests {
         // must close each redundant OS fd without weakening the foreign fence.
         let alias = path.with_extension("alias.db");
         fs::hard_link(&path, &alias).expect("hard-link the same inode");
-        let reopens = if cfg!(target_os = "macos") { 10_000 } else { 128 };
+        let reopens = if cfg!(target_os = "macos") {
+            10_000
+        } else {
+            128
+        };
         for i in 0..reopens {
             let spelling = if i % 2 == 0 { &path } else { &alias };
             let (mut peer, _) = vfs.open(&cx, Some(spelling), flags).expect("reopen peer");
@@ -4837,7 +4841,11 @@ mod tests {
             assert_eq!(info.n_wal_lifetime, 2);
             assert_eq!(
                 info.deferred_close_files.len(),
-                if cfg!(target_os = "macos") { 0 } else { reopens + 1 }
+                if cfg!(target_os = "macos") {
+                    0
+                } else {
+                    reopens + 1
+                }
             );
         }
         assert!(
