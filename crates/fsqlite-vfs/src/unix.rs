@@ -715,8 +715,9 @@ struct InodeInfo {
     /// POSIX fcntl locks are per-process, and closing *any* fd for the file can
     /// release the process' locks. To avoid that, we keep exactly one canonical
     /// fd per inode for I/O/locking and share it across handles via `Arc`.
-    /// Racing redundant opens remain inert in `deferred_close_files` until no
-    /// process lock claim survives.
+    /// On classic-POSIX platforms, racing redundant opens remain inert in
+    /// `deferred_close_files` until no process lock claim survives. Darwin's
+    /// OFD/flock ownership lets those unrelated descriptors close immediately.
     file: Arc<File>,
     /// Total number of open file handles referencing this inode.
     n_ref: u32,
@@ -747,7 +748,8 @@ struct InodeInfo {
     ///
     /// Closing *any* descriptor for an inode drops all classic `fcntl` locks
     /// held by the process. These descriptors therefore remain open until the
-    /// last coalesced lock claim has been released.
+    /// last coalesced lock claim has been released. Empty on Darwin, where all
+    /// locks this VFS establishes belong to the canonical open description.
     deferred_close_files: Vec<Arc<File>>,
     /// Set once byte-range/OFD `fcntl` locking on this inode was rejected and
     /// the backend dropped to the coarse whole-file `flock(2)` fallback. This
@@ -794,6 +796,16 @@ impl InodeInfo {
             || self.n_pending != 0
             || self.n_transient_shared_pending != 0
             || self.n_exclusive != 0
+    }
+
+    /// Classic POSIX locks are process-owned: closing ANY descriptor for the
+    /// inode erases them. Darwin's `fcntl_setlk` uses OFD locks (or flock),
+    /// both owned by the canonical open file description instead. A redundant
+    /// open has no locks and can close immediately there, even while idle WAL
+    /// attachments retain the canonical descriptor's lifetime SHARED claim.
+    /// Keep the canonical Arc and all logical lock accounting unchanged.
+    fn must_defer_redundant_close(&self) -> bool {
+        !cfg!(target_os = "macos") && self.has_lock_claims()
     }
 
     /// Close redundant descriptors only while the inode mutex proves that no
@@ -847,8 +859,8 @@ impl InodeTable {
     /// shard mutex before the inode mutex. This prevents a last close from
     /// evicting an entry between a reopen's lookup and registration. When a
     /// racing open produced a redundant descriptor while locks are held, that
-    /// descriptor is retained until the final lock claim is released; closing
-    /// it earlier would silently erase every classic POSIX lock for the inode.
+    /// descriptor is retained on classic-POSIX platforms until the final lock
+    /// claim is released. Darwin OFD/flock locks need no redundant-fd retention.
     fn register_opened_file(
         &self,
         key: InodeKey,
@@ -875,7 +887,7 @@ impl InodeTable {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let Some(next_ref) = info.n_ref.checked_add(1) else {
-                    if info.has_lock_claims() {
+                    if info.must_defer_redundant_close() {
                         info.deferred_close_files.push(opened);
                     } else {
                         drop(opened);
@@ -886,7 +898,7 @@ impl InodeTable {
                 };
                 info.n_ref = next_ref;
                 let canonical = Arc::clone(&info.file);
-                if info.has_lock_claims() {
+                if info.must_defer_redundant_close() {
                     info.deferred_close_files.push(opened);
                 } else {
                     // Keep the inode mutex held while the redundant descriptor
@@ -1028,14 +1040,14 @@ impl InodeTable {
 
         if let Some(current) = map.get(&key) {
             if !Arc::ptr_eq(current, &inode_info) {
-                // A stale descriptor for the same inode can erase locks held by
-                // the current generation when it closes. Defer it into the
-                // current lock domain if any claim is live; otherwise close it
-                // under the shard+inode critical section.
+                // On classic-POSIX platforms a stale descriptor can erase the
+                // current generation's locks. Darwin's OFD/flock ownership
+                // keeps generations independent. Close or defer according to
+                // the same platform policy as a redundant open.
                 let mut current_guard = current
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if current_guard.has_lock_claims() {
+                if current_guard.must_defer_redundant_close() {
                     current_guard.deferred_close_files.push(file);
                 } else {
                     drop(file);
@@ -4654,7 +4666,7 @@ mod tests {
     }
 
     #[test]
-    fn redundant_descriptor_close_is_deferred_until_posix_locks_are_gone() {
+    fn redundant_descriptor_close_preserves_platform_lock_ownership() {
         let cx = Cx::new();
         let vfs = UnixVfs::new();
         let (_dir, path) = make_temp_path("deferred-redundant-fd.db");
@@ -4672,8 +4684,8 @@ mod tests {
             assert_eq!(info.n_ref, 2);
             assert_eq!(
                 info.deferred_close_files.len(),
-                1,
-                "the redundant descriptor must remain open while fcntl locks exist"
+                usize::from(!cfg!(target_os = "macos")),
+                "only process-owned locks require redundant descriptor retention"
             );
         }
 
@@ -4784,7 +4796,10 @@ mod tests {
             let info = first.inode_info_ref().lock().expect("inode state");
             assert_eq!(info.n_wal_lifetime, 2);
             assert_eq!(info.n_shared, 0, "idle attachments are not transactions");
-            assert_eq!(info.deferred_close_files.len(), 1);
+            assert_eq!(
+                info.deferred_close_files.len(),
+                usize::from(!cfg!(target_os = "macos"))
+            );
         }
         let foreign_exclusive = || {
             let output = Command::new(std::env::current_exe().unwrap())
@@ -4803,6 +4818,31 @@ mod tests {
         assert!(
             !foreign_exclusive(),
             "foreign last-close lock must conflict"
+        );
+        // A long-lived, idle WAL reader is enough to pin classic deferred
+        // closes. Exercise the actual VFS through both path spellings: Darwin
+        // must close each redundant OS fd without weakening the foreign fence.
+        let alias = path.with_extension("alias.db");
+        fs::hard_link(&path, &alias).expect("hard-link the same inode");
+        let reopens = if cfg!(target_os = "macos") { 10_000 } else { 128 };
+        for i in 0..reopens {
+            let spelling = if i % 2 == 0 { &path } else { &alias };
+            let (mut peer, _) = vfs.open(&cx, Some(spelling), flags).expect("reopen peer");
+            assert!(Arc::ptr_eq(first.inode_info_ref(), peer.inode_info_ref()));
+            peer.close(&cx).expect("close transient peer");
+        }
+        {
+            let info = first.inode_info_ref().lock().expect("inode state");
+            assert_eq!(info.n_ref, 2);
+            assert_eq!(info.n_wal_lifetime, 2);
+            assert_eq!(
+                info.deferred_close_files.len(),
+                if cfg!(target_os = "macos") { 0 } else { reopens + 1 }
+            );
+        }
+        assert!(
+            !foreign_exclusive(),
+            "repeated redundant closes must retain the foreign writer fence"
         );
         assert_eq!(second.wal_checkpoint_reader_horizon(&cx, 41).unwrap(), 41);
         second
